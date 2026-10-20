@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>つづり | 日記</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Klee+One:wght@600&family=Zen+Maru+Gothic:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="app"></main>
+
+  <script type="module">
+    import {
+      boot, me, profile, MOODS, moodEmoji, categories, findCat, addCustomCat,
+      getDiary, saveDiary, setDiaryShared, deleteDiary, getUserName,
+      todayKey, fmtDate, isDateKey, esc, toast, errMsg,
+    } from './js/app.js';
+
+    const params = new URLSearchParams(location.search);
+    const friendUid = params.get('u');
+    const date = isDateKey(params.get('date')) ? params.get('date') : todayKey();
+    const app = document.getElementById('app');
+
+    const ctx = await boot(friendUid ? '' : 'diary.html');
+    if (ctx) route().catch((e) => { app.innerHTML = `<div class="card empty">${esc(errMsg(e))}</div>`; });
+
+    async function route() {
+      if (friendUid && friendUid !== me.uid) return showFriend();
+      const diary = await getDiary(date);
+      if (diary && !params.get('edit')) {
+        showMine(diary);
+        if (params.get('saved')) { toast('日記を保存しました 📔'); history.replaceState(null, '', `diary.html?date=${date}`); }
+      } else {
+        showEditor(diary);
+      }
+    }
+
+    // ================= 閲覧表示 =================
+    function viewHTML(diary, extraCats = []) {
+      const cats = (diary.categories || [])
+        .map((c) => ({ ...c, items: (c.items || []).filter((i) => i.trim()) }))
+        .filter((c) => c.items.length);
+      return `
+        <div class="card">
+          <div class="diary-head">
+            <span style="font-size:2.2rem">${moodEmoji(diary.mood)}</span>
+            <div style="flex:1;min-width:0">
+              <div class="muted">${fmtDate(diary.date)}</div>
+              <h1>${esc(diary.title || '無題の日')}</h1>
+            </div>
+          </div>
+          ${diary.text ? `<div class="view-text">${esc(diary.text)}</div>` : '<p class="muted">（本文なし）</p>'}
+          ${cats.length ? `<div class="view-cats">${cats.map((c) => {
+            const k = findCat(c.id, extraCats);
+            return `<div class="view-cat"><h3>${k.icon} ${esc(k.name)}</h3><ul>${c.items.map((i) => `<li>${esc(i)}</li>`).join('')}</ul></div>`;
+          }).join('')}</div>` : ''}
+        </div>`;
+    }
+
+    // ================= 友達の日記 =================
+    async function showFriend() {
+      const [name, diary] = await Promise.all([
+        getUserName(friendUid),
+        getDiary(date, friendUid).catch(() => null), // 非公開・友達でない場合は読めない
+      ]);
+      const back = `<a class="btn ghost" href="mypage.html?u=${encodeURIComponent(friendUid)}&m=${date.slice(0, 7)}">← ${esc(name || '友達')}さんのカレンダー</a>`;
+      if (!diary) {
+        app.innerHTML = `<div class="card empty">この日の日記は見られません（非公開か、まだ書かれていません）</div><div class="row" style="margin-top:16px">${back}</div>`;
+        return;
+      }
+      app.innerHTML = `
+        <div class="shared-banner">💌 ${esc(name || '友達')}さんの日記</div>
+        ${viewHTML(diary, diary.customCatDefs || [])}
+        <div class="row" style="margin-top:16px">${back}</div>`;
+    }
+
+    // ================= 自分の日記 =================
+    function showMine(diary) {
+      app.innerHTML = `
+        ${viewHTML(diary)}
+        <div class="row" style="margin-top:16px">
+          <span class="vis-badge ${diary.shared ? 'shared' : ''}" id="vis-badge">${diary.shared ? '👥 友達に公開中' : '🔒 自分だけ'}</span>
+          <button class="btn small ghost" id="toggle-vis">${diary.shared ? '自分だけにする' : '友達に公開する'}</button>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <a class="btn ghost" href="mypage.html?m=${date.slice(0, 7)}">← カレンダー</a>
+          <span class="spacer"></span>
+          <button class="btn danger small" id="del">削除</button>
+          <a class="btn primary" href="diary.html?date=${date}&edit=1">✏️ 編集</a>
+        </div>`;
+      document.getElementById('toggle-vis').onclick = async (e) => {
+        e.target.disabled = true;
+        try {
+          await setDiaryShared(date, !diary.shared);
+          diary.shared = !diary.shared;
+          toast(diary.shared ? '友達に公開しました' : '自分だけに戻しました');
+          showMine(diary);
+        } catch (err) { toast(errMsg(err)); e.target.disabled = false; }
+      };
+      document.getElementById('del').onclick = async () => {
+        if (!confirm(`${fmtDate(date)} の日記を削除しますか？`)) return;
+        try { await deleteDiary(date); location.href = 'index.html'; }
+        catch (err) { toast(errMsg(err)); }
+      };
+    }
+
+    // ================= 書く・編集する =================
+    function showEditor(existing) {
+      const state = existing
+        ? JSON.parse(JSON.stringify({ title: existing.title || '', text: existing.text || '', mood: existing.mood || 0, categories: existing.categories || [], shared: !!existing.shared }))
+        : { title: '', text: '', mood: 0, categories: [], shared: profile.defaultShared !== false };
+      let dirty = false;
+
+      app.innerHTML = `
+        <div class="card">
+          <div class="muted">${date === todayKey() ? '今日の日記' : '日記'}</div>
+          <h1 style="font-size:1.5rem;margin-bottom:8px">${fmtDate(date)}</h1>
+
+          <span class="field-label">今日の気分</span>
+          <div class="mood-picker" id="moods">${MOODS.map((m) =>
+            `<button type="button" data-v="${m.v}" title="${m.label}" aria-label="${m.label}" aria-pressed="${state.mood === m.v}">${m.e}</button>`).join('')}</div>
+
+          <label class="field-label" for="title">タイトル</label>
+          <input type="text" id="title" maxlength="60" placeholder="例：はじめてのジム" value="${esc(state.title)}">
+
+          <label class="field-label" for="text">自由に書く</label>
+          <textarea id="text" class="free-text" maxlength="20000" placeholder="今日あったこと、思ったこと、なんでも。">${esc(state.text)}</textarea>
+        </div>
+
+        <div class="card">
+          <h2 style="font-size:1.1rem">今日したこと・見たもの</h2>
+          <p class="muted" style="margin:4px 0 12px">項目をタップして追加。いくつでも選べます。</p>
+          <div class="chip-grid" id="chips"></div>
+          <div class="cat-blocks" id="blocks"></div>
+        </div>
+
+        <div class="card">
+          <span class="field-label" style="margin-top:0">公開範囲</span>
+          <div class="vis-toggle" id="vis">
+            <button type="button" data-v="1" aria-pressed="${state.shared}">👥 友達に公開</button>
+            <button type="button" data-v="0" aria-pressed="${!state.shared}">🔒 自分だけ</button>
+          </div>
+          <p class="muted" style="margin:8px 0 0" id="vis-note"></p>
+        </div>
+
+        <div class="save-bar">
+          <a class="btn ghost" href="${existing ? `diary.html?date=${date}` : 'index.html'}">キャンセル</a>
+          <button class="btn primary" id="save">保存する</button>
+        </div>`;
+
+      const chipsEl = document.getElementById('chips');
+      const blocksEl = document.getElementById('blocks');
+      const visNote = () => {
+        document.getElementById('vis-note').textContent = state.shared
+          ? '友達になった人がこの日記を読めます。'
+          : 'あなただけが読めます。あとから公開することもできます。';
+      };
+
+      function renderChips() {
+        const active = new Set(state.categories.map((c) => c.id));
+        chipsEl.innerHTML = categories().map((c) =>
+          `<button type="button" class="chip ${active.has(c.id) ? 'active' : ''}" data-id="${c.id}">${c.icon} ${esc(c.name)}</button>`).join('')
+          + '<button type="button" class="chip add" id="addcat">＋ 項目をつくる</button>';
+      }
+      function renderBlocks() {
+        const extra = (existing && existing.customCatDefs) || [];
+        blocksEl.innerHTML = state.categories.map((c, ci) => {
+          const k = findCat(c.id, extra);
+          return `<div class="cat-block" data-ci="${ci}">
+            <div class="head">${k.icon} ${esc(k.name)}<span class="spacer"></span>
+              <button type="button" class="icon-btn" data-remove-cat="${ci}" title="この項目を外す" aria-label="この項目を外す">✕</button></div>
+            ${c.items.map((it, ii) => `<div class="item-row">
+              <input type="text" data-ci="${ci}" data-ii="${ii}" maxlength="200" value="${esc(it)}" placeholder="${esc(k.hint || '内容を入力')}">
+              <button type="button" class="icon-btn" data-remove-item="${ci}:${ii}" aria-label="行を削除">−</button></div>`).join('')}
+            <button type="button" class="btn small ghost" data-add-item="${ci}">＋ もう1つ追加</button>
+          </div>`;
+        }).join('');
+      }
+      function rerender(focusCi) {
+        renderChips(); renderBlocks();
+        if (focusCi != null) {
+          const inputs = blocksEl.querySelectorAll(`input[data-ci="${focusCi}"]`);
+          if (inputs.length) inputs[inputs.length - 1].focus();
+        }
+      }
+
+      chipsEl.addEventListener('click', async (e) => {
+        const b = e.target.closest('button'); if (!b) return;
+        if (b.id === 'addcat') {
+          const name = prompt('新しい項目の名前（例：ポッドキャスト）');
+          if (!name || !name.trim()) return;
+          const icon = (prompt('アイコンにする絵文字（空欄でもOK）', '🏷️') || '🏷️').trim();
+          try {
+            const cat = await addCustomCat(name.trim(), icon);
+            state.categories.push({ id: cat.id, items: [''] }); dirty = true;
+            rerender(state.categories.length - 1);
+          } catch (err) { toast(errMsg(err)); }
+          return;
+        }
+        const id = b.dataset.id;
+        const idx = state.categories.findIndex((c) => c.id === id);
+        if (idx >= 0) {
+          blocksEl.querySelector(`[data-ci="${idx}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          blocksEl.querySelector(`input[data-ci="${idx}"]`)?.focus();
+        } else {
+          state.categories.push({ id, items: [''] }); dirty = true;
+          rerender(state.categories.length - 1);
+        }
+      });
+      blocksEl.addEventListener('input', (e) => {
+        const t = e.target;
+        if (t.dataset.ci != null && t.dataset.ii != null) { state.categories[t.dataset.ci].items[t.dataset.ii] = t.value; dirty = true; }
+      });
+      blocksEl.addEventListener('keydown', (e) => {
+        const t = e.target; // Enter で次の行を追加
+        if (e.key === 'Enter' && !e.isComposing && t.dataset.ci != null) {
+          e.preventDefault();
+          const ci = +t.dataset.ci;
+          state.categories[ci].items.push(''); rerender(ci);
+        }
+      });
+      blocksEl.addEventListener('click', (e) => {
+        const b = e.target.closest('button'); if (!b) return;
+        if (b.dataset.removeCat != null) {
+          const ci = +b.dataset.removeCat;
+          if (state.categories[ci].items.some((i) => i.trim()) && !confirm('この項目の内容を消しますか？')) return;
+          state.categories.splice(ci, 1); dirty = true; rerender();
+        } else if (b.dataset.addItem != null) {
+          const ci = +b.dataset.addItem; state.categories[ci].items.push(''); rerender(ci);
+        } else if (b.dataset.removeItem) {
+          const [ci, ii] = b.dataset.removeItem.split(':').map(Number);
+          state.categories[ci].items.splice(ii, 1);
+          if (!state.categories[ci].items.length) state.categories.splice(ci, 1);
+          dirty = true; rerender();
+        }
+      });
+
+      document.getElementById('moods').addEventListener('click', (e) => {
+        const b = e.target.closest('button'); if (!b) return;
+        const v = +b.dataset.v;
+        state.mood = state.mood === v ? 0 : v; dirty = true;
+        document.querySelectorAll('#moods button').forEach((x) => x.setAttribute('aria-pressed', +x.dataset.v === state.mood));
+      });
+      document.getElementById('vis').addEventListener('click', (e) => {
+        const b = e.target.closest('button'); if (!b) return;
+        state.shared = b.dataset.v === '1'; dirty = true;
+        document.querySelectorAll('#vis button').forEach((x) => x.setAttribute('aria-pressed', (x.dataset.v === '1') === state.shared));
+        visNote();
+      });
+      document.getElementById('title').addEventListener('input', (e) => { state.title = e.target.value; dirty = true; });
+      document.getElementById('text').addEventListener('input', (e) => { state.text = e.target.value; dirty = true; });
+
+      const saveBtn = document.getElementById('save');
+      saveBtn.onclick = async () => {
+        const cats = state.categories
+          .map((c) => ({ id: c.id, items: c.items.map((i) => i.trim()).filter(Boolean) }))
+          .filter((c) => c.items.length);
+        if (!state.text.trim() && !state.title.trim() && !cats.length && !state.mood) {
+          toast('何かひとつ書いてから保存してね'); return;
+        }
+        saveBtn.disabled = true; saveBtn.textContent = '保存中…';
+        try {
+          await saveDiary(date, { title: state.title.trim(), text: state.text, mood: state.mood, categories: cats, shared: state.shared }, existing);
+          dirty = false;
+          location.href = `diary.html?date=${date}&saved=1`;
+        } catch (err) {
+          toast('保存できませんでした：' + errMsg(err));
+          saveBtn.disabled = false; saveBtn.textContent = '保存する';
+        }
+      };
+
+      window.addEventListener('beforeunload', (e) => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
+      visNote();
+      rerender();
+    }
+  </script>
+</body>
+</html>
