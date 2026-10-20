@@ -1,0 +1,13 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "diaries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "shared", "order": "ASCENDING" },
+        { "fieldPath": "date", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

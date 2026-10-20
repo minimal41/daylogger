@@ -1,0 +1,116 @@
+rules_version = '2';
+
+// つづり — Firestore セキュリティルール
+//
+//  users/{uid}                    プロフィール（名前・友達コード・カスタム項目）
+//  users/{uid}/diaries/{date}     日記（date = YYYY-MM-DD、shared = 友達に公開）
+//  users/{uid}/friends/{fid}      友達（両方のユーザーに1件ずつ作る）
+//  friendCodes/{code}             友達コード → uid の対応表
+//  friendRequests/{from_to}       友達申請（承認・拒否・取り消しで削除）
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isMe(uid) { return signedIn() && request.auth.uid == uid; }
+    // uid さんの友達リストに自分が入っているか
+    function isFriendOf(uid) {
+      return signedIn() && exists(/databases/$(database)/documents/users/$(uid)/friends/$(request.auth.uid));
+    }
+    function requestExists(from, to) {
+      return exists(/databases/$(database)/documents/friendRequests/$(from + '_' + to));
+    }
+    function validName(n) { return n is string && n.size() > 0 && n.size() <= 20; }
+    function validCats(c) { return c is list && c.size() <= 100; }
+
+    // ---------------- プロフィール ----------------
+    match /users/{uid} {
+      allow read: if isMe(uid) || isFriendOf(uid);
+
+      allow create: if isMe(uid)
+        && request.resource.data.keys().hasOnly(['name', 'friendCode', 'customCats', 'defaultShared', 'createdAt'])
+        && validName(request.resource.data.name)
+        && validCats(request.resource.data.customCats)
+        && request.resource.data.defaultShared is bool
+        // 同じ書き込み（バッチ）で自分用の友達コードを登録していること
+        && getAfter(/databases/$(database)/documents/friendCodes/$(request.resource.data.friendCode)).data.uid == uid;
+
+      allow update: if isMe(uid)
+        && request.resource.data.keys().hasOnly(['name', 'friendCode', 'customCats', 'defaultShared', 'createdAt'])
+        && request.resource.data.friendCode == resource.data.friendCode
+        && request.resource.data.createdAt == resource.data.createdAt
+        && validName(request.resource.data.name)
+        && validCats(request.resource.data.customCats)
+        && request.resource.data.defaultShared is bool;
+
+      allow delete: if false;
+
+      // ---------------- 日記 ----------------
+      match /diaries/{date} {
+        // 本人はすべて、友達は「友達に公開」の日記だけ読める
+        allow read: if isMe(uid) || (isFriendOf(uid) && resource.data.shared == true);
+
+        allow create, update: if isMe(uid)
+          && date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          && request.resource.data.keys().hasOnly(['date', 'title', 'text', 'mood', 'categories', 'customCatDefs', 'shared', 'createdAt', 'updatedAt'])
+          && request.resource.data.date == date
+          && request.resource.data.title is string && request.resource.data.title.size() <= 60
+          && request.resource.data.text is string && request.resource.data.text.size() <= 20000
+          && request.resource.data.mood is int && request.resource.data.mood >= 0 && request.resource.data.mood <= 5
+          && request.resource.data.categories is list && request.resource.data.categories.size() <= 60
+          && request.resource.data.customCatDefs is list && request.resource.data.customCatDefs.size() <= 60
+          && request.resource.data.shared is bool;
+
+        allow delete: if isMe(uid);
+      }
+
+      // ---------------- 友達 ----------------
+      match /friends/{fid} {
+        allow read: if isMe(uid);
+        // 申請を受け取った人（to）だけが、承認時に両方の友達ドキュメントを作れる
+        //   自分側: users/{自分}/friends/{申請した人}   … 申請 fid → uid が存在
+        //   相手側: users/{申請した人}/friends/{自分}   … 申請 uid → fid が存在
+        allow create: if request.resource.data.keys().hasOnly(['since'])
+          && ((isMe(uid) && requestExists(fid, uid)) || (isMe(fid) && requestExists(uid, fid)));
+        allow update: if false;
+        // どちらからでも友達をやめられる
+        allow delete: if isMe(uid) || isMe(fid);
+      }
+    }
+
+    // ---------------- 友達コード ----------------
+    match /friendCodes/{code} {
+      allow get: if signedIn();
+      allow list: if false; // 一覧取得は禁止（総当たり対策）
+      allow create: if signedIn()
+        && code.matches('^[A-HJ-NP-Z2-9]{8}$')
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.friendCode == code;
+      allow update, delete: if false;
+    }
+
+    // ---------------- 友達申請 ----------------
+    match /friendRequests/{rid} {
+      allow read: if signedIn()
+        && (resource.data.from == request.auth.uid || resource.data.to == request.auth.uid);
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['from', 'to', 'fromName', 'toCode', 'createdAt'])
+        && request.resource.data.from == request.auth.uid
+        && request.resource.data.to is string
+        && request.resource.data.to != request.auth.uid
+        && rid == request.resource.data.from + '_' + request.resource.data.to
+        && validName(request.resource.data.fromName)
+        && request.resource.data.toCode is string
+        // 実在するコードと相手が一致していること
+        && get(/databases/$(database)/documents/friendCodes/$(request.resource.data.toCode)).data.uid == request.resource.data.to
+        // すでに友達なら申請できない
+        && !exists(/databases/$(database)/documents/users/$(request.auth.uid)/friends/$(request.resource.data.to));
+
+      allow update: if false;
+      // 承認・拒否（受け取った人）と取り消し（送った人）
+      allow delete: if signedIn()
+        && (resource.data.from == request.auth.uid || resource.data.to == request.auth.uid);
+    }
+  }
+}
