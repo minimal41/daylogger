@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>つづり | マイページ</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Klee+One:wght@600&family=Zen+Maru+Gothic:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="app"></main>
+
+  <script type="module">
+    import {
+      boot, me, profile, logout, updateMyProfile, getUserName, findCat, moodEmoji,
+      monthDiaries, countMyDiaries, getStreak, allMyDiaries, localDiaries, migrateLocal,
+      listFriends, incomingRequests, outgoingRequests, sendFriendRequest, acceptFriendRequest,
+      deleteFriendRequest, removeFriend,
+      todayKey, pad, WEEK, esc, toast, errMsg, entryItemHTML,
+    } from './js/app.js';
+
+    const params = new URLSearchParams(location.search);
+    const viewUid = params.get('u');
+    const app = document.getElementById('app');
+
+    const ctx = await boot(viewUid ? '' : 'mypage.html');
+    if (ctx) {
+      const run = viewUid && viewUid !== me.uid ? renderFriendPage : renderMyPage;
+      run().catch((e) => { app.innerHTML = `<div class="card empty">${esc(errMsg(e))}</div>`; });
+    }
+
+    // =========================================================
+    //  カレンダー（自分・友達の両方で使う）
+    // =========================================================
+    function createCalendar(el, { uid, own, onMonth }) {
+      let cur = (() => {
+        const m = params.get('m');
+        if (m && /^\d{4}-\d{2}$/.test(m)) { const [y, mo] = m.split('-').map(Number); return new Date(y, mo - 1, 1); }
+        const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1);
+      })();
+      const cache = {};
+
+      el.innerHTML = `
+        <div class="cal-head">
+          <button class="btn small ghost" data-prev aria-label="前の月">‹ 前の月</button>
+          <h2 data-title></h2>
+          <button class="btn small ghost" data-next aria-label="次の月">次の月 ›</button>
+        </div>
+        <div class="cal-grid" data-grid></div>
+        <div class="cal-legend">${own
+          ? '色のついた日は日記があります。日付をタップすると見返せます（書いていない日はその日の日記を書けます）。'
+          : '色のついた日は友達が公開している日記です。タップすると読めます。'}</div>
+        <h3 style="font-size:1rem;margin:20px 0 10px" data-list-title></h3>
+        <div class="entry-list" data-list></div>`;
+
+      const href = (key) => own ? `diary.html?date=${key}` : `diary.html?u=${encodeURIComponent(uid)}&date=${key}`;
+
+      async function render() {
+        const y = cur.getFullYear(), m = cur.getMonth();
+        const ym = `${y}-${pad(m + 1)}`;
+        $q('[data-title]').textContent = `${y}年 ${m + 1}月`;
+        const now = new Date();
+        $q('[data-next]').disabled = y > now.getFullYear() || (y === now.getFullYear() && m >= now.getMonth());
+
+        let list = cache[ym];
+        if (!list) {
+          $q('[data-grid]').style.opacity = '.5';
+          try { list = cache[ym] = await monthDiaries(ym, uid); }
+          catch (e) { toast(errMsg(e)); list = []; }
+          $q('[data-grid]').style.opacity = '';
+        }
+        if (`${cur.getFullYear()}-${pad(cur.getMonth() + 1)}` !== ym) return; // 連打対策
+        const byDate = Object.fromEntries(list.map((d) => [d.date, d]));
+        const today = todayKey();
+
+        let html = WEEK.map((w) => `<div class="cal-dow">${w}</div>`).join('');
+        const first = new Date(y, m, 1).getDay();
+        const days = new Date(y, m + 1, 0).getDate();
+        for (let i = 0; i < first; i++) html += '<div class="cal-day blank"></div>';
+        for (let d = 1; d <= days; d++) {
+          const key = `${ym}-${pad(d)}`;
+          const dow = new Date(y, m, d).getDay();
+          const diary = byDate[key];
+          const disabled = key > today || (!own && !diary);
+          const cls = ['cal-day', dow === 0 ? 'sun' : '', dow === 6 ? 'sat' : '', key === today ? 'today' : '', diary ? 'has' : '', disabled ? 'future' : ''].join(' ');
+          const label = `${m + 1}月${d}日${diary ? '（日記あり）' : ''}`;
+          const inner = `<span class="num">${d}</span>${diary ? `<span class="m">${moodEmoji(diary.mood)}</span>` : ''}`;
+          html += disabled
+            ? `<div class="${cls}" aria-label="${label}">${inner}</div>`
+            : `<a class="${cls}" href="${href(key)}" aria-label="${label}" title="${esc(diary ? (diary.title || '無題の日') : 'この日の日記を書く')}">${inner}</a>`;
+        }
+        $q('[data-grid]').innerHTML = html;
+        $q('[data-list-title]').textContent = `${m + 1}月の日記（${list.length}件）`;
+        $q('[data-list]').innerHTML = list.length
+          ? list.map((d) => entryItemHTML(d, href(d.date), own ? (d.shared ? '・👥 公開' : '・🔒 自分だけ') : '')).join('')
+          : '<div class="empty">この月の日記はありません</div>';
+        onMonth && onMonth(list);
+      }
+      const $q = (s) => el.querySelector(s);
+      $q('[data-prev]').onclick = () => { cur = new Date(cur.getFullYear(), cur.getMonth() - 1, 1); render(); };
+      $q('[data-next]').onclick = () => { cur = new Date(cur.getFullYear(), cur.getMonth() + 1, 1); render(); };
+      render();
+    }
+
+    // =========================================================
+    //  友達のページ（mypage.html?u=xxx）
+    // =========================================================
+    async function renderFriendPage() {
+      const name = await getUserName(viewUid);
+      if (name === null) {
+        app.innerHTML = '<div class="card empty">この人の日記は見られません（友達ではありません）</div><div class="row" style="margin-top:16px"><a class="btn ghost" href="mypage.html#friends">← 友達一覧</a></div>';
+        return;
+      }
+      app.innerHTML = `
+        <section class="card">
+          <div class="profile"><div class="avatar">${esc(name.slice(0, 1))}</div>
+            <div><div class="muted">友達</div><h1 style="font-size:1.4rem">${esc(name)}さんの日記</h1></div></div>
+        </section>
+        <section class="card" id="cal"></section>
+        <div class="row" style="margin-top:16px"><a class="btn ghost" href="mypage.html#friends">← 友達一覧</a></div>`;
+      createCalendar(document.getElementById('cal'), { uid: viewUid, own: false });
+    }
+
+    // =========================================================
+    //  自分のマイページ
+    // =========================================================
+    async function renderMyPage() {
+      app.innerHTML = `
+        <section class="card">
+          <div class="profile">
+            <div class="avatar" id="avatar">${esc((profile.name || '?').slice(0, 1))}</div>
+            <div style="flex:1;min-width:180px">
+              <label class="muted" for="name">あなたの名前（友達に表示されます）</label>
+              <div class="row" style="flex-wrap:nowrap">
+                <input type="text" id="name" maxlength="20" value="${esc(profile.name)}">
+                <button class="btn small" id="save-name" style="white-space:nowrap">保存</button>
+              </div>
+            </div>
+          </div>
+          <div class="stats" style="margin-top:16px">
+            <div class="stat"><b id="st-total">…</b><span>書いた日記</span></div>
+            <div class="stat"><b id="st-streak">…</b><span>連続日数</span></div>
+            <div class="stat"><b id="st-top">-</b><span id="st-top-label">今月よく書く項目</span></div>
+          </div>
+        </section>
+
+        <div id="migrate-slot"></div>
+
+        <section class="card">
+          <div class="tabs" role="tablist">
+            <button role="tab" id="tab-cal" aria-selected="true">📅 カレンダー</button>
+            <button role="tab" id="tab-friends" aria-selected="false">👥 友達 <span id="req-count"></span></button>
+          </div>
+          <div id="panel-cal"></div>
+          <div id="panel-friends" hidden>
+            <span class="field-label" style="margin-top:0">あなたの友達コード</span>
+            <div class="code-box">
+              <span class="code" id="my-code">${esc(profile.friendCode)}</span>
+              <span class="spacer"></span>
+              <button class="btn small" id="copy-code">コピー</button>
+            </div>
+            <p class="muted">このコードを友達に教えると、友達申請が届きます。</p>
+
+            <label class="field-label" for="code-input">友達のコードで申請する</label>
+            <div class="row" style="flex-wrap:nowrap">
+              <input type="text" id="code-input" maxlength="12" placeholder="例：AB3DEF7H" autocapitalize="characters" autocomplete="off">
+              <button class="btn primary small" id="send-req" style="white-space:nowrap">申請</button>
+            </div>
+
+            <div id="incoming"></div>
+            <div id="outgoing"></div>
+            <h3 class="sub-title">友達</h3>
+            <div id="friend-list"><div class="loading"><span class="spinner"></span></div></div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2 style="font-size:1rem">アカウント</h2>
+          <p class="muted">${esc(me.email || '')}　日記はクラウドに保存されているので、別のスマホやPCからログインしても読めます。</p>
+          <div class="row">
+            <button class="btn small" id="export">日記を書き出す（JSON）</button>
+            <label class="btn small">以前の版のバックアップを読み込む<input type="file" id="import-old" accept="application/json,.json" hidden></label>
+            <span class="spacer"></span>
+            <button class="btn small ghost" id="logout">ログアウト</button>
+          </div>
+        </section>`;
+
+      // ---- プロフィール ----
+      const nameInput = document.getElementById('name');
+      document.getElementById('save-name').onclick = async () => {
+        const v = nameInput.value.trim();
+        if (!v) { toast('名前を入力してください'); return; }
+        try { await updateMyProfile({ name: v }); document.getElementById('avatar').textContent = v.slice(0, 1); toast('名前を保存しました'); }
+        catch (e) { toast(errMsg(e)); }
+      };
+      nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) document.getElementById('save-name').click(); });
+
+      countMyDiaries().then((n) => { document.getElementById('st-total').textContent = n ?? '-'; });
+      getStreak().then((n) => { document.getElementById('st-streak').textContent = n; }).catch(() => {});
+
+      // ---- タブ ----
+      function selectTab(name) {
+        const isCal = name === 'cal';
+        document.getElementById('tab-cal').setAttribute('aria-selected', isCal);
+        document.getElementById('tab-friends').setAttribute('aria-selected', !isCal);
+        document.getElementById('panel-cal').hidden = !isCal;
+        document.getElementById('panel-friends').hidden = isCal;
+        history.replaceState(null, '', isCal ? `mypage.html${location.search}` : `mypage.html${location.search}#friends`);
+      }
+      document.getElementById('tab-cal').onclick = () => selectTab('cal');
+      document.getElementById('tab-friends').onclick = () => selectTab('friends');
+      if (location.hash === '#friends') selectTab('friends');
+      window.addEventListener('hashchange', () => {
+        selectTab(location.hash === '#friends' ? 'friends' : 'cal');
+        if (location.hash === '#friends') renderFriends().catch(() => {});
+      });
+
+      // ---- カレンダー ----
+      createCalendar(document.getElementById('panel-cal'), {
+        uid: me.uid, own: true,
+        onMonth(list) {
+          const count = {};
+          list.forEach((d) => (d.categories || []).forEach((c) => { count[c.id] = (count[c.id] || 0) + 1; }));
+          const top = Object.entries(count).sort((a, b) => b[1] - a[1])[0];
+          const el = document.getElementById('st-top');
+          const label = document.getElementById('st-top-label');
+          if (top) { const k = findCat(top[0]); el.textContent = k.icon; label.textContent = k.name; }
+          else { el.textContent = '-'; label.textContent = 'よく書く項目'; }
+        },
+      });
+
+      // ---- 友達 ----
+      document.getElementById('copy-code').onclick = async () => {
+        try { await navigator.clipboard.writeText(profile.friendCode); toast('友達コードをコピーしました'); }
+        catch { toast(profile.friendCode); }
+      };
+      const sendBtn = document.getElementById('send-req');
+      sendBtn.onclick = async () => {
+        const input = document.getElementById('code-input');
+        if (!input.value.trim()) return;
+        sendBtn.disabled = true;
+        try {
+          const r = await sendFriendRequest(input.value);
+          toast(r === 'accepted' ? '友達になりました 🎉' : '友達申請を送りました');
+          input.value = '';
+          renderFriends();
+        } catch (e) { toast(errMsg(e)); }
+        sendBtn.disabled = false;
+      };
+      document.getElementById('code-input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) sendBtn.click(); });
+
+      async function renderFriends() {
+        const [inc, out, friends] = await Promise.all([incomingRequests(), outgoingRequests(), listFriends()]);
+        document.getElementById('req-count').textContent = inc.length ? `（申請 ${inc.length}）` : '';
+
+        document.getElementById('incoming').innerHTML = inc.length ? `<h3 class="sub-title">届いた友達申請</h3>${inc.map((r) => `
+          <div class="req-item"><div class="avatar">${esc((r.fromName || '?').slice(0, 1))}</div>
+            <div style="flex:1;min-width:0"><b>${esc(r.fromName)}</b>さん</div>
+            <button class="btn small primary" data-accept="${esc(r.id)}">承認</button>
+            <button class="btn small ghost" data-decline="${esc(r.id)}">断る</button></div>`).join('')}` : '';
+
+        document.getElementById('outgoing').innerHTML = out.length ? `<h3 class="sub-title">申請中</h3>${out.map((r) => `
+          <div class="req-item"><div class="avatar">⏳</div>
+            <div style="flex:1;min-width:0">コード <b>${esc(r.toCode)}</b> の人<div class="muted">承認を待っています</div></div>
+            <button class="btn small ghost" data-cancel="${esc(r.id)}">取り消す</button></div>`).join('')}` : '';
+
+        document.getElementById('friend-list').innerHTML = friends.length ? friends.map((f) => `
+          <div class="friend-item"><div class="avatar">${esc(f.name.slice(0, 1))}</div>
+            ${f.active ? `<a class="name" href="mypage.html?u=${encodeURIComponent(f.uid)}">${esc(f.name)}</a>` : `<span class="name muted" style="flex:1">${esc(f.name)}</span>`}
+            ${f.active ? `<a class="btn small" href="mypage.html?u=${encodeURIComponent(f.uid)}">日記を見る</a>` : ''}
+            <button class="icon-btn" data-remove="${esc(f.uid)}" data-name="${esc(f.name)}" title="友達をやめる" aria-label="友達をやめる">✕</button></div>`).join('')
+          : '<div class="empty">まだ友達はいません。友達コードを交換しましょう 👋</div>';
+
+        const byId = Object.fromEntries([...inc, ...out].map((r) => [r.id, r]));
+        document.querySelectorAll('[data-accept]').forEach((b) => b.onclick = () => act(b, () => acceptFriendRequest(byId[b.dataset.accept]), '友達になりました 🎉'));
+        document.querySelectorAll('[data-decline]').forEach((b) => b.onclick = () => act(b, () => deleteFriendRequest(byId[b.dataset.decline]), '申請を断りました'));
+        document.querySelectorAll('[data-cancel]').forEach((b) => b.onclick = () => act(b, () => deleteFriendRequest(byId[b.dataset.cancel]), '申請を取り消しました'));
+        document.querySelectorAll('[data-remove]').forEach((b) => b.onclick = () => {
+          if (confirm(`${b.dataset.name}さんと友達をやめますか？お互いの日記が見られなくなります。`)) act(b, () => removeFriend(b.dataset.remove), '友達をやめました');
+        });
+      }
+      async function act(btn, fn, msg) {
+        btn.disabled = true;
+        try { await fn(); toast(msg); renderFriends(); }
+        catch (e) { toast(errMsg(e)); btn.disabled = false; }
+      }
+      renderFriends().catch((e) => { document.getElementById('friend-list').innerHTML = `<div class="empty">${esc(errMsg(e))}</div>`; });
+
+      // ---- 以前の端末保存版からの移行 ----
+      const local = localDiaries();
+      if (local) {
+        const n = Object.keys(local.diaries).length;
+        const slot = document.getElementById('migrate-slot');
+        slot.innerHTML = `<section class="card migrate">
+          <h2 style="font-size:1rem">この端末に以前の日記があります（${n}件）</h2>
+          <p class="muted">アカウントに移すと、どの端末からでも見られるようになります。移した日記は「自分だけ」の設定になります。</p>
+          <button class="btn primary small" id="do-migrate">アカウントに移す</button>
+        </section>`;
+        document.getElementById('do-migrate').onclick = async (e) => {
+          e.target.disabled = true; e.target.textContent = '移しています…';
+          try { const c = await migrateLocal(local); toast(`${c}件の日記を移しました`); setTimeout(() => location.reload(), 900); }
+          catch (err) { toast(errMsg(err)); e.target.disabled = false; e.target.textContent = 'アカウントに移す'; }
+        };
+      }
+
+      // 以前の版（端末保存）で「書き出す」したJSONを取り込む
+      document.getElementById('import-old').onchange = async (e) => {
+        const file = e.target.files[0]; if (!file) return;
+        try {
+          const data = JSON.parse(await file.text());
+          // 以前の版：diaries は { 'YYYY-MM-DD': {...} }、この版：diaries は配列
+          const diaries = Array.isArray(data.diaries)
+            ? Object.fromEntries(data.diaries.map((d) => [d.date, d]))
+            : (data.diaries || {});
+          const n = Object.keys(diaries).length;
+          if (data.app !== 'tsuzuri' || !n) throw new Error('つづりのバックアップファイルではないようです');
+          if (!confirm(`${n}件の日記を読み込みます。同じ日付の日記は上書きされます。読み込んだ日記は「自分だけ」になります。`)) return;
+          const c = await migrateLocal({ diaries, customCats: data.customCats || [] });
+          toast(`${c}件の日記を読み込みました`); setTimeout(() => location.reload(), 900);
+        } catch (err) { toast(errMsg(err)); }
+        e.target.value = '';
+      };
+
+      // ---- アカウント ----
+      document.getElementById('logout').onclick = () => { if (confirm('ログアウトしますか？')) logout(); };
+      document.getElementById('export').onclick = async () => {
+        try {
+          const diaries = await allMyDiaries();
+          const plain = diaries.map((d) => ({ ...d, createdAt: d.createdAt?.toDate?.().toISOString() ?? null, updatedAt: d.updatedAt?.toDate?.().toISOString() ?? null }));
+          const blob = new Blob([JSON.stringify({ app: 'tsuzuri', exportedAt: new Date().toISOString(), name: profile.name, customCats: profile.customCats, diaries: plain }, null, 2)], { type: 'application/json' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob); a.download = `tsuzuri-${todayKey()}.json`; a.click();
+          setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        } catch (e) { toast(errMsg(e)); }
+      };
+    }
+  </script>
+</body>
+</html>
