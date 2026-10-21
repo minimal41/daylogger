@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>つづり | マイページ</title>
+  <title>Daylogger | マイページ</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Klee+One:wght@600&family=Zen+Maru+Gothic:wght@400;700&display=swap" rel="stylesheet">
@@ -315,7 +315,7 @@
             ? Object.fromEntries(data.diaries.map((d) => [d.date, d]))
             : (data.diaries || {});
           const n = Object.keys(diaries).length;
-          if (data.app !== 'tsuzuri' || !n) throw new Error('つづりのバックアップファイルではないようです');
+          if (data.app !== 'tsuzuri' || !n) throw new Error('Dayloggerのバックアップファイルではないようです');
           if (!confirm(`${n}件の日記を読み込みます。同じ日付の日記は上書きされます。読み込んだ日記は「自分だけ」になります。`)) return;
           const c = await migrateLocal({ diaries, customCats: data.customCats || [] });
           toast(`${c}件の日記を読み込みました`); setTimeout(() => location.reload(), 900);
