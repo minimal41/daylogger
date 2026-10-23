@@ -72,7 +72,6 @@
           </div>
           <div class="stat-grid">${STATS.map((s) => `
             <div class="stat-tile"><span>${s.icon} ${s.name}</span><b>${bs[s.key]}</b><small>日記で +${Math.max(0, (player.stats || {})[s.key] || 0)}</small></div>`).join('')}
-            <div class="stat-tile"><span>💧 最大MP</span><b>${bs.mp}</b><small>レベルと まりょく で上がる</small></div>
             <div class="stat-tile"><span>🏆 戦績</span><b>${player.wins || 0}<small>勝</small> ${player.losses || 0}<small>敗</small></b><small>バトルの結果</small></div>
           </div>
 

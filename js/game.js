@@ -26,6 +26,7 @@ export function levelInfo(exp) {
 // =====================================================================
 export const STATS = [
   { key: 'hp',  icon: '❤️', name: 'HP' },
+  { key: 'mp',  icon: '💧', name: 'MP' },
   { key: 'atk', icon: '⚔️', name: 'こうげき' },
   { key: 'def', icon: '🛡️', name: 'ぼうぎょ' },
   { key: 'mag', icon: '🔮', name: 'まりょく' },
@@ -49,8 +50,8 @@ export const CAT_STATS = {
   place:    { spd: 1, luk: 1 },
   food:     { hp: 2 },
   cook:     { hp: 1, def: 1 },
-  cafe:     { hp: 1, luk: 1 },
-  music:    { mag: 1, spd: 1 },
+  cafe:     { mp: 1, luk: 1 },
+  music:    { mp: 1, mag: 1 },
   live:     { atk: 1, spd: 1 },
   book:     { mag: 2 },
   manga:    { mag: 1, luk: 1 },
@@ -67,9 +68,9 @@ export const CAT_STATS = {
   people:   { def: 1, luk: 1 },
   shopping: { luk: 2 },
   weather:  { hp: 1, luk: 1 },
-  sleep:    { hp: 2 },
-  good:     { luk: 2 },
-  thanks:   { hp: 1, def: 1 },
+  sleep:    { hp: 1, mp: 1 },
+  good:     { mp: 1, luk: 1 },
+  thanks:   { mp: 1, def: 1 },
   todo:     { atk: 1, def: 1 },
   photo:    { spd: 1, luk: 1 },
 };
@@ -112,7 +113,7 @@ export function battleStats(p, mult = 1) {
     mag: r(8 + level * 2 + pt('mag')),
     spd: r(6 + level * 1.5 + pt('spd')),
     luk: r(5 + level + pt('luk')),
-    mp:  15 + level * 2 + Math.floor(pt('mag') / 4),
+    mp:  15 + level * 2 + pt('mp'),
   };
 }
 
