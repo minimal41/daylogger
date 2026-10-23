@@ -15,8 +15,9 @@
   <script type="module">
     import {
       boot, profile, getDiary, recentDiaries, countMyDiaries, getStreak, friendFeed,
-      todayKey, WEEK, esc, entryItemHTML, errMsg,
+      todayKey, WEEK, esc, entryItemHTML, errMsg, player, expBarHTML, battlesLeft,
     } from './js/app.js';
+    import { levelInfo, BATTLES_PER_DAY } from './js/game.js';
 
     const ctx = await boot('index.html');
     if (ctx) render().catch((e) => { document.getElementById('app').innerHTML = `<div class="card empty">${esc(errMsg(e))}</div>`; });
@@ -48,6 +49,12 @@
           <p class="greet">${greet}　${esc(profile.name)}さん</p>
           ${hero}
         </section>
+
+        ${player ? `<a class="card game-mini" href="battle.html">
+          <div class="lv-badge"><small>Lv</small>${levelInfo(player.exp).level}</div>
+          <div style="flex:1;min-width:0">${expBarHTML(player.exp)}</div>
+          <div class="game-mini-battle">⚔️ バトル<br><b>のこり ${battlesLeft()}/${BATTLES_PER_DAY}</b></div>
+        </a>` : ''}
 
         <div class="stats" style="margin-top:20px">
           <div class="card stat"><b id="st-streak">…</b><span>連続日数</span></div>

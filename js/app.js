@@ -9,8 +9,12 @@ import {
   initializeFirestore, getFirestore, persistentLocalCache, persistentMultipleTabManager,
   connectFirestoreEmulator, doc, getDoc, setDoc, updateDoc, deleteDoc, collection, query,
   where, orderBy, limit, getDocs, writeBatch, serverTimestamp, getCountFromServer, arrayUnion,
+  runTransaction, increment,
 } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js';
 import { firebaseConfig, useEmulator } from './firebase-config.js';
+import {
+  BATTLES_PER_DAY, SKILLS, levelInfo, diaryReward, emptyStats, addStats, fmtStats,
+} from './game.js';
 
 // =====================================================================
 //  初期化
@@ -38,6 +42,8 @@ getRedirectResult(auth).catch(() => {}); // スマホでリダイレクトログ
 export let me = null;
 /** users/{uid} のプロフィール */
 export let profile = null;
+/** players/{uid} のゲームデータ（読み込めなかったときは null） */
+export let player = null;
 
 // =====================================================================
 //  項目（カテゴリ）
@@ -146,7 +152,7 @@ export function entryItemHTML(diary, href, extraMeta = '') {
 //  ヘッダー・ログイン画面・起動処理
 // =====================================================================
 function renderHeader(current) {
-  const links = [['index.html', 'ホーム'], ['diary.html', '日記を書く'], ['mypage.html', 'マイページ']];
+  const links = [['index.html', 'ホーム'], ['diary.html', '日記を書く'], ['battle.html', 'バトル'], ['mypage.html', 'マイページ']];
   const header = document.createElement('header');
   header.className = 'site-header';
   header.innerHTML = `<div class="inner">
@@ -272,6 +278,9 @@ export async function boot(current) {
     main.innerHTML = `<div class="card empty">${esc(errMsg(e))}</div>`;
     return null;
   }
+  // ゲームデータが読めなくても日記は使えるようにする
+  try { player = await ensurePlayer(); }
+  catch (e) { console.warn('ゲームデータを読み込めませんでした', e); player = null; }
   return { user, profile };
 }
 
@@ -283,6 +292,10 @@ export const logout = () => signOut(auth).then(() => { location.href = 'index.ht
 export async function updateMyProfile(patch) {
   await updateDoc(doc(db, 'users', me.uid), patch);
   Object.assign(profile, patch);
+  if (patch.name && player) {
+    await updateDoc(playerRef(), { name: patch.name }).catch(() => {});
+    player.name = patch.name;
+  }
 }
 export async function addCustomCat(name, icon) {
   const cat = { id: 'c_' + Date.now().toString(36), icon: icon || '🏷️', name: name.slice(0, 20), hint: '' };
@@ -313,8 +326,15 @@ export async function getDiary(date, uid = me.uid) {
   return s.exists() ? s.data() : null;
 }
 
+/**
+ * 日記を保存し、経験値・ステータスを反映する。
+ * 戻り値はもらえた分（rewardHTML() に渡す）。変化がなければ null
+ */
 export async function saveDiary(date, data, existing) {
   const used = (profile.customCats || []).filter((c) => data.categories.some((x) => x.id === c.id));
+  const old = (existing && existing.reward) || null;
+  // 経験値の対象は今日・昨日の日記だけ。それより前の日記を直しても、前にもらった分はそのまま
+  const reward = player && isRewardable(date) ? diaryReward(data) : old;
   const body = {
     date,
     title: data.title,
@@ -326,16 +346,26 @@ export async function saveDiary(date, data, existing) {
     createdAt: (existing && existing.createdAt) || serverTimestamp(),
     updatedAt: serverTimestamp(),
   };
-  await commitWrite(setDoc(doc(diariesCol(me.uid), date), body));
+  if (reward) body.reward = reward;
+  const b = writeBatch(db);
+  b.set(doc(diariesCol(me.uid), date), body);
+  // 前回保存したときの分との差だけ足す（書き直しても二重にもらえない）
+  const result = player && reward !== old ? applyReward(b, rewardDelta(reward, old)) : null;
+  await commitWrite(b.commit());
   if (profile.defaultShared !== body.shared) updateMyProfile({ defaultShared: body.shared }).catch(() => {});
+  return result;
 }
 
 export async function setDiaryShared(date, shared) {
   await commitWrite(updateDoc(doc(diariesCol(me.uid), date), { shared, updatedAt: serverTimestamp() }));
 }
 
-export async function deleteDiary(date) {
-  await commitWrite(deleteDoc(doc(diariesCol(me.uid), date)));
+/** existing: 削除する日記（もらった経験値・ステータスを差し引く） */
+export async function deleteDiary(date, existing) {
+  const b = writeBatch(db);
+  b.delete(doc(diariesCol(me.uid), date));
+  if (player && existing && existing.reward) applyReward(b, rewardDelta(null, existing.reward));
+  await commitWrite(b.commit());
 }
 
 /** 新しい順に n 件。他人の場合は公開されている日記だけ */
@@ -504,4 +534,130 @@ export async function friendFeed(perFriend = 3, total = 8) {
   return lists.flat()
     .sort((a, b) => (b.date.localeCompare(a.date)) || ((b.updatedAt?.seconds || 0) - (a.updatedAt?.seconds || 0)))
     .slice(0, total);
+}
+
+// =====================================================================
+//  ゲーム（レベル・ステータス・バトル）
+// =====================================================================
+const playerRef = (uid = me.uid) => doc(db, 'players', uid);
+const ONLINE_MS = 5 * 60 * 1000; // この時間内に開いていた人を「オンライン」とする
+
+/** 経験値がもらえる日記（今日と昨日の分） */
+export function isRewardable(date) {
+  const y = new Date(); y.setDate(y.getDate() - 1);
+  return date >= toKey(y) && date <= todayKey();
+}
+
+function rewardDelta(next, prev) {
+  const stats = addStats(addStats({}, next && next.stats), prev && prev.stats, -1);
+  Object.keys(stats).forEach((k) => { if (!stats[k]) delete stats[k]; });
+  return { exp: ((next && next.exp) || 0) - ((prev && prev.exp) || 0), stats };
+}
+
+/** バッチに経験値・ステータスの加算を入れて、手元の player にも反映する */
+function applyReward(b, delta) {
+  if (!delta.exp && !Object.keys(delta.stats).length) return null;
+  const patch = { exp: increment(delta.exp) };
+  Object.entries(delta.stats).forEach(([k, v]) => { patch[`stats.${k}`] = increment(v); });
+  b.update(playerRef(), patch);
+  const before = levelInfo(player.exp).level;
+  player.exp += delta.exp;
+  player.stats = addStats({ ...emptyStats(), ...player.stats }, delta.stats);
+  return { ...delta, before, after: levelInfo(player.exp).level };
+}
+
+/** 初回はこれまでの日記ぶんの経験値・ステータスをまとめて付与してゲームデータを作る */
+async function ensurePlayer() {
+  const ref = playerRef();
+  const snap = await getDoc(ref);
+  if (snap.exists()) {
+    const p = snap.data();
+    // オンライン表示用。書き込みを減らすため数分おきにだけ更新する
+    if (navigator.onLine && Date.now() - (p.lastActive?.toMillis?.() || 0) > 3 * 60 * 1000) touchActive().catch(() => {});
+    return p;
+  }
+  const diaries = await allMyDiaries();
+  const data = {
+    name: profile.name, exp: 0, stats: emptyStats(), wins: 0, losses: 0,
+    battleDate: '', battleCount: 0, lastActive: serverTimestamp(), createdAt: serverTimestamp(),
+  };
+  const b = writeBatch(db);
+  diaries.forEach((d) => {
+    const r = diaryReward(d);
+    data.exp += r.exp;
+    addStats(data.stats, r.stats);
+    // 今日・昨日の日記は書き直すと差分で計算するので、もらった分を記録しておく
+    if (isRewardable(d.date)) b.update(doc(diariesCol(me.uid), d.date), { reward: r });
+  });
+  b.set(ref, data);
+  await b.commit();
+  return { ...data, lastActive: null, createdAt: null };
+}
+
+/** 「オンライン」の表示を更新する */
+export async function touchActive() {
+  await updateDoc(playerRef(), { lastActive: serverTimestamp() });
+}
+export const isOnline = (p) => !!p.lastActive && Date.now() - p.lastActive.toMillis() < ONLINE_MS;
+
+export const battlesUsed = () => (player && player.battleDate === todayKey() ? player.battleCount : 0);
+export const battlesLeft = () => (player ? BATTLES_PER_DAY - battlesUsed() : 0);
+
+/** バトルを1回分使う（1日3回まで）。足りなければエラー */
+export async function useBattle() {
+  const today = todayKey();
+  const n = await runTransaction(db, async (tx) => {
+    const p = (await tx.get(playerRef())).data();
+    const used = p.battleDate === today ? p.battleCount : 0;
+    if (used >= BATTLES_PER_DAY) throw new Error(`今日のバトルはもう${BATTLES_PER_DAY}回しました。また明日！`);
+    tx.update(playerRef(), { battleDate: today, battleCount: used + 1, lastActive: serverTimestamp() });
+    return used + 1;
+  });
+  player.battleDate = today;
+  player.battleCount = n;
+}
+
+/** バトルの結果を記録する。勝ったら経験値をもらう */
+export async function recordBattle(win, exp) {
+  const b = writeBatch(db);
+  b.update(playerRef(), win ? { wins: increment(1) } : { losses: increment(1) });
+  const result = win ? applyReward(b, { exp, stats: {} }) : null;
+  await b.commit();
+  if (win) player.wins = (player.wins || 0) + 1; else player.losses = (player.losses || 0) + 1;
+  return result;
+}
+
+export async function getPlayer(uid) {
+  const s = await getDoc(playerRef(uid));
+  return s.exists() ? { uid, ...s.data() } : null;
+}
+
+/** 最近アプリを開いた人（自分以外） */
+export async function recentPlayers(n = 40) {
+  const s = await getDocs(query(collection(db, 'players'), orderBy('lastActive', 'desc'), limit(n)));
+  return s.docs.filter((d) => d.id !== me.uid).map((d) => ({ uid: d.id, ...d.data() }));
+}
+
+export function expBarHTML(exp) {
+  const { cur, need } = levelInfo(exp);
+  const pct = need ? Math.floor((cur / need) * 100) : 100;
+  return `<div class="exp-wrap">
+    <div class="exp-bar" role="progressbar" aria-label="経験値" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><i style="width:${pct}%"></i></div>
+    <div class="exp-text">${need ? `次のレベルまで あと ${need - cur} EXP` : 'レベル最大！'}</div>
+  </div>`;
+}
+
+/** saveDiary() / recordBattle() の戻り値を表示する */
+export function rewardHTML(r, title = '') {
+  const learned = SKILLS.filter((s) => s.lv > r.before && s.lv <= r.after);
+  const stats = fmtStats(r.stats);
+  return `<section class="card reward ${r.after > r.before ? 'up' : ''}" role="status">
+    ${title ? `<div class="reward-title">${title}</div>` : ''}
+    <div class="reward-exp">${r.exp >= 0 ? '+' : ''}${r.exp} EXP</div>
+    ${stats ? `<div class="reward-stats">${stats}</div>` : ''}
+    ${r.after > r.before ? `<div class="levelup">🎉 レベルアップ！ Lv${r.before} → <b>Lv${r.after}</b></div>` : ''}
+    ${r.after < r.before ? `<div class="muted">レベルが下がりました（Lv${r.before} → Lv${r.after}）</div>` : ''}
+    ${learned.map((s) => `<div class="learned">${s.icon} 新しいスキル「${esc(s.name)}」を覚えた！</div>`).join('')}
+    ${player ? expBarHTML(player.exp) : ''}
+  </section>`;
 }

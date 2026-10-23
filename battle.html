@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Daylogger | バトル</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Klee+One:wght@600&family=Zen+Maru+Gothic:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="app"></main>
+
+  <script type="module">
+    import {
+      boot, player, categories, listFriends, getPlayer, recentPlayers, isOnline, touchActive,
+      battlesLeft, useBattle, recordBattle, expBarHTML, rewardHTML, esc, toast, errMsg,
+    } from './js/app.js';
+    import {
+      BATTLES_PER_DAY, STATS, SKILLS, CPUS, MAX_STAT_CATS, ATTACK, levelInfo, battleStats, skillDesc,
+      catStats, fmtStats, cpuFighter, makeFighter, newBattle, playRound, pvpReward,
+    } from './js/game.js';
+
+    const app = document.getElementById('app');
+    let tab = 'cpu';
+    let inBattle = false;
+    const known = new Map(); // 読み込んだ対戦相手（uid → players のデータ）
+
+    const ctx = await boot('battle.html');
+    if (ctx) {
+      if (!player) {
+        app.innerHTML = `<div class="card empty">ゲームデータを読み込めませんでした。<br>
+          通信状態を確認するか、管理者は最新の firestore.rules を公開してください。</div>`;
+      } else {
+        renderLobby();
+        // バトル画面を開いているあいだは「オンライン」にしておく
+        setInterval(() => { if (document.visibilityState === 'visible') touchActive().catch(() => {}); }, 2 * 60 * 1000);
+        window.addEventListener('beforeunload', (e) => { if (inBattle) { e.preventDefault(); e.returnValue = ''; } });
+      }
+    }
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const lvOf = (p) => levelInfo(p.exp).level;
+    function ago(ts) {
+      if (!ts) return '';
+      const m = Math.floor((Date.now() - ts.toMillis()) / 60000);
+      if (m < 60) return `${Math.max(1, m)}分前`;
+      if (m < 60 * 24) return `${Math.floor(m / 60)}時間前`;
+      return `${Math.floor(m / 60 / 24)}日前`;
+    }
+
+    // =========================================================
+    //  ロビー（ステータス・対戦相手えらび）
+    // =========================================================
+    function renderLobby() {
+      const { level } = levelInfo(player.exp);
+      const bs = battleStats(player);
+      const left = battlesLeft();
+      // まだ覚えていないスキルは次の2つだけ見せる
+      const nextLvs = SKILLS.filter((s) => s.lv > level).map((s) => s.lv);
+      const cutoff = nextLvs.length ? nextLvs[Math.min(1, nextLvs.length - 1)] : level;
+      const shown = SKILLS.filter((s) => s.lv <= cutoff).length;
+      app.innerHTML = `
+        <section class="card">
+          <div class="profile">
+            <div class="avatar">${esc((player.name || '?').slice(0, 1))}</div>
+            <div style="flex:1;min-width:0">
+              <div class="row"><h1 class="status-name">${esc(player.name)}</h1><span class="lv-badge"><small>Lv</small>${level}</span></div>
+              ${expBarHTML(player.exp)}
+            </div>
+          </div>
+          <div class="stat-grid">${STATS.map((s) => `
+            <div class="stat-tile"><span>${s.icon} ${s.name}</span><b>${bs[s.key]}</b><small>日記で +${Math.max(0, (player.stats || {})[s.key] || 0)}</small></div>`).join('')}
+          </div>
+          <p class="muted" style="margin:10px 0 0">MP ${bs.mp}　・　戦績 ${player.wins || 0}勝 ${player.losses || 0}敗</p>
+
+          <h3 class="sub-title">スキル</h3>
+          <div class="skill-list">${SKILLS.filter((s) => s.lv <= cutoff).map((s) => `
+            <div class="skill ${s.lv > level ? 'locked' : ''}">
+              <b>${s.lv > level ? '🔒' : s.icon} ${esc(s.name)}</b>
+              <span>${s.lv > level ? `Lv${s.lv}で覚える` : `MP${s.mp}・${skillDesc(s)}`}</span>
+            </div>`).join('')}
+          </div>
+          ${SKILLS.length > shown ? `<p class="muted" style="margin:6px 0 0">ほかにも ${SKILLS.length - shown} 個のスキルがレベルアップで覚えられます</p>` : ''}
+
+          <details class="help">
+            <summary>どうやって強くなる？</summary>
+            <p><b>日記を書くと経験値</b>：1件 30 EXP ＋ 項目1つにつき 5（${MAX_STAT_CATS}項目まで）＋ 本文40文字ごとに 2（最大30）＋ 気分 5 ＋ タイトル 3。<br>
+              経験値がもらえるのは今日と昨日の日記です。書き直すと差分だけ増減し、削除するとその分は戻ります。</p>
+            <p><b>項目でステータスが上がる</b>（1日${MAX_STAT_CATS}項目まで。本文を300文字以上書くと 🔮まりょく+1）</p>
+            <div class="cat-stat-list">${categories().map((c) => `<span class="tag">${c.icon} ${esc(c.name)}：${fmtStats(catStats(c.id))}</span>`).join('')}</div>
+            <p><b>バトルに勝つと経験値</b>：強い相手ほどたくさんもらえます。バトルは1日${BATTLES_PER_DAY}回まで。</p>
+          </details>
+        </section>
+
+        <section class="card">
+          <div class="battle-left">
+            今日のバトル <span class="pips" aria-hidden="true">${'⚔️'.repeat(left)}${'<span class="used">⚔️</span>'.repeat(BATTLES_PER_DAY - left)}</span>
+            のこり <b>${left}</b> / ${BATTLES_PER_DAY} 回
+          </div>
+          ${left <= 0 ? '<p class="muted">今日のバトルはおしまい。日記を書いて明日に備えよう！</p>' : ''}
+          <div class="tabs" role="tablist">
+            <button role="tab" data-tab="cpu" aria-selected="${tab === 'cpu'}">🤖 CPU</button>
+            <button role="tab" data-tab="friends" aria-selected="${tab === 'friends'}">👥 友達</button>
+            <button role="tab" data-tab="online" aria-selected="${tab === 'online'}">🌐 オンライン</button>
+          </div>
+          <div id="panel"></div>
+        </section>`;
+
+      app.querySelectorAll('[data-tab]').forEach((b) => b.onclick = () => {
+        tab = b.dataset.tab;
+        app.querySelectorAll('[data-tab]').forEach((x) => x.setAttribute('aria-selected', x === b));
+        renderPanel();
+      });
+      document.getElementById('panel').addEventListener('click', onPanelClick);
+      renderPanel();
+    }
+
+    async function renderPanel() {
+      const panel = document.getElementById('panel');
+      const current = tab;
+      const off = battlesLeft() <= 0 ? 'disabled' : '';
+      if (tab === 'cpu') {
+        panel.innerHTML = `<div class="cpu-grid">${CPUS.map((c) => `
+          <button class="cpu-card" data-cpu="${c.rank}" ${off}>
+            <span class="cpu-icon">${c.icon}</span>
+            <span class="cpu-rank">レベル ${c.rank}</span>
+            <b>${esc(c.name)}</b>
+            <small>めやす Lv${c.level}・勝つと +${c.exp} EXP</small>
+          </button>`).join('')}</div>`;
+        return;
+      }
+      panel.innerHTML = '<div class="loading"><span class="spinner"></span></div>';
+      try {
+        const html = tab === 'friends' ? await friendsHTML(off) : await onlineHTML(off);
+        if (tab === current) panel.innerHTML = html;
+      } catch (e) {
+        if (tab === current) panel.innerHTML = `<div class="empty">${esc(errMsg(e))}</div>`;
+      }
+    }
+
+    function playerRowHTML(p, off) {
+      known.set(p.uid, p);
+      const lv = lvOf(p);
+      const myLv = levelInfo(player.exp).level;
+      return `<div class="player-item">
+        <div class="avatar">${esc((p.name || '?').slice(0, 1))}</div>
+        <div style="flex:1;min-width:0">
+          <div class="player-name"><b>${esc(p.name)}</b> <span class="lv-chip">Lv${lv}</span>
+            ${isOnline(p) ? '<span class="online-dot">● オンライン</span>' : `<span class="muted">${ago(p.lastActive)}</span>`}</div>
+          <div class="muted">${p.wins || 0}勝 ${p.losses || 0}敗・勝つと +${pvpReward(myLv, lv)} EXP</div>
+        </div>
+        <button class="btn small primary" data-fight="${esc(p.uid)}" ${off}>バトル</button>
+      </div>`;
+    }
+
+    async function friendsHTML(off) {
+      const friends = (await listFriends()).filter((f) => f.active);
+      if (!friends.length) return '<div class="empty">まだ友達がいません。<a href="mypage.html#friends">マイページ</a>で友達コードを交換しよう 👋</div>';
+      const players = await Promise.all(friends.map((f) => getPlayer(f.uid).catch(() => null)));
+      return `<p class="muted">相手の今のステータスと自動でたたかいます（相手がオンラインでなくてもOK）。</p>`
+        + friends.map((f, i) => (players[i]
+          ? playerRowHTML(players[i], off)
+          : `<div class="player-item"><div class="avatar">${esc(f.name.slice(0, 1))}</div>
+              <div style="flex:1;min-width:0"><b>${esc(f.name)}</b><div class="muted">まだゲームを始めていません</div></div></div>`)).join('');
+    }
+
+    async function onlineHTML(off) {
+      const myLv = levelInfo(player.exp).level;
+      const all = await recentPlayers();
+      const online = all.filter(isOnline).sort((a, b) => Math.abs(lvOf(a) - myLv) - Math.abs(lvOf(b) - myLv));
+      const recent = all.filter((p) => !isOnline(p)).slice(0, 15);
+      if (!all.length) return '<div class="empty">まだほかのプレイヤーがいません</div>';
+      return `
+        <div class="row" style="margin-bottom:8px">
+          <p class="muted" style="margin:0;flex:1;min-width:200px">オンラインの人の中から、レベルの近い人とマッチングします。</p>
+          <button class="btn primary small" data-random ${off}>🎲 ランダムマッチ</button>
+        </div>
+        <h3 class="sub-title">🟢 オンライン中（${online.length}人）</h3>
+        ${online.length ? online.map((p) => playerRowHTML(p, off)).join('') : '<div class="empty">いまオンラインの人はいません</div>'}
+        ${recent.length ? `<h3 class="sub-title">最近あそんだ人</h3>${recent.map((p) => playerRowHTML(p, off)).join('')}` : ''}`;
+    }
+
+    function onPanelClick(e) {
+      const b = e.target.closest('button'); if (!b || b.disabled) return;
+      if (b.dataset.cpu) {
+        const c = CPUS.find((x) => x.rank === +b.dataset.cpu);
+        start(cpuFighter(c), c.exp, `🤖 CPU レベル${c.rank}`);
+      } else if (b.dataset.fight) {
+        const p = known.get(b.dataset.fight);
+        startPvp(p, tab === 'friends' ? '👥 友達とバトル' : '🌐 オンラインバトル');
+      } else if (b.dataset.random != null) {
+        const myLv = levelInfo(player.exp).level;
+        const pool = [...known.values()].filter(isOnline);
+        const list = (pool.length ? pool : [...known.values()])
+          .sort((x, y) => Math.abs(lvOf(x) - myLv) - Math.abs(lvOf(y) - myLv)).slice(0, 3);
+        if (!list.length) { toast('対戦できる相手がいません'); return; }
+        startPvp(list[Math.floor(Math.random() * list.length)], '🎲 ランダムマッチ');
+      }
+    }
+
+    function startPvp(p, label) {
+      const foe = makeFighter({ name: p.name, exp: p.exp, stats: p.stats, smart: 0.75 });
+      start(foe, pvpReward(levelInfo(player.exp).level, foe.level), label);
+    }
+
+    async function start(foe, reward, label) {
+      if (battlesLeft() <= 0) { toast(`今日のバトルはもう${BATTLES_PER_DAY}回しました。また明日！`); return; }
+      if (!confirm(`${foe.name}（Lv${foe.level}）とバトルしますか？\n始めると今日のバトルを1回使います（のこり ${battlesLeft()} 回）。`)) return;
+      try { await useBattle(); }
+      catch (e) { toast(errMsg(e)); renderLobby(); return; }
+      const me = makeFighter({ name: player.name, exp: player.exp, stats: player.stats });
+      runBattle(newBattle(me, foe), reward, label);
+    }
+
+    // =========================================================
+    //  バトル画面
+    // =========================================================
+    function fighterHTML(f) {
+      return `<div class="fighter ${f.side}" id="f-${f.side}">
+        ${f.icon ? `<div class="f-icon">${f.icon}</div>` : `<div class="avatar f-icon">${esc(f.name.slice(0, 1))}</div>`}
+        <div class="f-info">
+          <div class="player-name"><b>${esc(f.name)}</b> <span class="lv-chip">Lv${f.level}</span>${f.side === 'a' ? ' <span class="muted">（あなた）</span>' : ''}</div>
+          <div class="bar hp"><i></i></div>
+          <div class="bar mp"><i></i></div>
+          <div class="bar-text"></div>
+        </div>
+      </div>`;
+    }
+
+    function runBattle(b, reward, label) {
+      inBattle = true;
+      window.scrollTo(0, 0);
+      app.innerHTML = `
+        <section class="card battle">
+          <div class="muted" style="text-align:center">${label}・勝つと +${reward} EXP</div>
+          <div class="arena">
+            ${fighterHTML(b.b)}
+            <div class="vs">VS</div>
+            ${fighterHTML(b.a)}
+          </div>
+          <div class="battle-log" id="log" aria-live="polite"></div>
+          <div class="actions" id="actions"></div>
+          <div class="row" id="flee-row" style="margin-top:12px"><span class="spacer"></span>
+            <button class="btn small ghost" id="flee">にげる（負けになります）</button></div>
+        </section>
+        <div id="result"></div>`;
+
+      const logEl = document.getElementById('log');
+      const actionsEl = document.getElementById('actions');
+      let busy = false;
+
+      const bars = (side, hp, mp) => {
+        const f = b[side], el = document.getElementById(`f-${side}`);
+        el.querySelector('.hp i').style.width = `${(hp / f.maxHp) * 100}%`;
+        el.querySelector('.hp').classList.toggle('low', hp / f.maxHp < 0.3);
+        el.querySelector('.mp i').style.width = `${(mp / f.maxMp) * 100}%`;
+        el.querySelector('.bar-text').textContent = `HP ${hp} / ${f.maxHp}　MP ${mp} / ${f.maxMp}`;
+      };
+      const syncBars = () => { bars('a', b.a.hp, b.a.mp); bars('b', b.b.hp, b.b.mp); };
+      const log = (text, kind = 'info') => {
+        const p = document.createElement('p');
+        p.className = `log-${kind}`;
+        p.textContent = text;
+        logEl.appendChild(p);
+        logEl.scrollTop = logEl.scrollHeight;
+      };
+
+      function renderActions() {
+        actionsEl.innerHTML = [ATTACK, ...b.a.skills].map((s) => `
+          <button class="act-btn" data-act="${s.id}" ${s.mp > b.a.mp ? 'disabled' : ''} title="${esc(s === ATTACK ? 'ふつうの攻撃' : skillDesc(s))}">
+            <b>${s.icon} ${esc(s.name)}</b><small>${s.mp ? `MP ${s.mp}` : 'MP 0'}</small>
+          </button>`).join('');
+      }
+
+      actionsEl.onclick = async (e) => {
+        const btn = e.target.closest('button[data-act]');
+        if (!btn || btn.disabled || busy) return;
+        busy = true;
+        actionsEl.querySelectorAll('button').forEach((x) => { x.disabled = true; });
+        log(`― ターン ${b.round} ―`, 'round');
+        for (const ev of playRound(b, btn.dataset.act)) {
+          log(ev.text, ev.kind);
+          bars('a', ev.hp.a, ev.mp.a); bars('b', ev.hp.b, ev.mp.b);
+          if (['hit', 'crit'].includes(ev.kind)) {
+            const el = document.getElementById(`f-${ev.side}`);
+            el.classList.remove('shake'); void el.offsetWidth; el.classList.add('shake');
+          }
+          await sleep(ev.kind === 'use' ? 380 : 620);
+        }
+        syncBars();
+        if (b.over) { finish(b.winner === 'a'); return; }
+        busy = false;
+        renderActions();
+      };
+
+      document.getElementById('flee').onclick = () => {
+        if (busy || !confirm('にげますか？ 負けになります')) return;
+        log(`${b.a.name}は にげだした…`, 'ko');
+        finish(false);
+      };
+
+      async function finish(win) {
+        inBattle = false;
+        busy = true;
+        actionsEl.innerHTML = '';
+        document.getElementById('flee-row').remove();
+        let result = null;
+        try { result = await recordBattle(win, win ? reward : 0); }
+        catch (e) { toast('結果を保存できませんでした：' + errMsg(e)); }
+        const el = document.getElementById('result');
+        el.innerHTML = `
+          <section class="card battle-result ${win ? 'win' : 'lose'}">
+            <div class="result-icon">${win ? '🏆' : '💤'}</div>
+            <h2>${win ? '勝利！' : '負けてしまった…'}</h2>
+            <p class="muted">${win ? `${esc(b.b.name)}に勝った！` : '日記を書いてステータスを上げて、また挑戦しよう'}</p>
+          </section>
+          ${result ? rewardHTML(result, '経験値をもらった！') : ''}
+          <div class="row" style="margin-top:16px">
+            <a class="btn ghost" href="index.html">ホームへ</a><span class="spacer"></span>
+            <button class="btn primary" id="back">バトルロビーへ</button>
+          </div>`;
+        document.getElementById('back').onclick = () => { renderLobby(); window.scrollTo(0, 0); };
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+
+      syncBars();
+      log(`${b.b.name}が あらわれた！`, 'info');
+      renderActions();
+    }
+  </script>
+</body>
+</html>

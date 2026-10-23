@@ -15,9 +15,12 @@
   <script type="module">
     import {
       boot, me, profile, MOODS, moodEmoji, categories, findCat, addCustomCat,
-      getDiary, saveDiary, setDiaryShared, deleteDiary, getUserName,
+      getDiary, saveDiary, setDiaryShared, deleteDiary, getUserName, player, isRewardable, rewardHTML,
       todayKey, fmtDate, isDateKey, esc, toast, errMsg,
     } from './js/app.js';
+    import { diaryReward, fmtStats, catStats, MAX_STAT_CATS } from './js/game.js';
+
+    const REWARD_KEY = 'daylogger.reward'; // 保存 → 表示画面にもらった経験値を渡す
 
     const params = new URLSearchParams(location.search);
     const friendUid = params.get('u');
@@ -79,7 +82,10 @@
 
     // ================= 自分の日記 =================
     function showMine(diary) {
+      let reward = null;
+      try { reward = JSON.parse(sessionStorage.getItem(REWARD_KEY) || 'null'); sessionStorage.removeItem(REWARD_KEY); } catch { /* noop */ }
       app.innerHTML = `
+        ${reward && reward.date === date ? rewardHTML(reward, reward.exp >= 0 ? '日記を書いて経験値をもらった！' : '日記を書き直したので経験値が変わりました') : ''}
         ${viewHTML(diary)}
         <div class="row" style="margin-top:16px">
           <span class="vis-badge ${diary.shared ? 'shared' : ''}" id="vis-badge">${diary.shared ? '👥 友達に公開中' : '🔒 自分だけ'}</span>
@@ -102,7 +108,7 @@
       };
       document.getElementById('del').onclick = async () => {
         if (!confirm(`${fmtDate(date)} の日記を削除しますか？`)) return;
-        try { await deleteDiary(date); location.href = 'index.html'; }
+        try { await deleteDiary(date, diary); location.href = 'index.html'; }
         catch (err) { toast(errMsg(err)); }
       };
     }
@@ -146,6 +152,8 @@
           <p class="muted" style="margin:8px 0 0" id="vis-note"></p>
         </div>
 
+        ${player ? '<div class="card reward-preview" id="reward-preview" aria-live="polite"></div>' : ''}
+
         <div class="save-bar">
           <a class="btn ghost" href="${existing ? `diary.html?date=${date}` : 'index.html'}">キャンセル</a>
           <button class="btn primary" id="save">保存する</button>
@@ -162,7 +170,7 @@
       function renderChips() {
         const active = new Set(state.categories.map((c) => c.id));
         chipsEl.innerHTML = categories().map((c) =>
-          `<button type="button" class="chip ${active.has(c.id) ? 'active' : ''}" data-id="${c.id}">${c.icon} ${esc(c.name)}</button>`).join('')
+          `<button type="button" class="chip ${active.has(c.id) ? 'active' : ''}" data-id="${c.id}" title="${esc(fmtStats(catStats(c.id)))}">${c.icon} ${esc(c.name)}</button>`).join('')
           + '<button type="button" class="chip add" id="addcat">＋ 項目をつくる</button>';
       }
       function renderBlocks() {
@@ -170,7 +178,7 @@
         blocksEl.innerHTML = state.categories.map((c, ci) => {
           const k = findCat(c.id, extra);
           return `<div class="cat-block" data-ci="${ci}">
-            <div class="head">${k.icon} ${esc(k.name)}<span class="spacer"></span>
+            <div class="head">${k.icon} ${esc(k.name)}${player ? `<span class="cat-stat">${fmtStats(catStats(c.id))}</span>` : ''}<span class="spacer"></span>
               <button type="button" class="icon-btn" data-remove-cat="${ci}" title="この項目を外す" aria-label="この項目を外す">✕</button></div>
             ${c.items.map((it, ii) => `<div class="item-row">
               <input type="text" data-ci="${ci}" data-ii="${ii}" maxlength="200" value="${esc(it)}" placeholder="${esc(k.hint || '内容を入力')}">
@@ -179,7 +187,24 @@
           </div>`;
         }).join('');
       }
+      // この日記でもらえる経験値の見込み
+      const previewEl = document.getElementById('reward-preview');
+      function renderPreview() {
+        if (!previewEl) return;
+        if (!isRewardable(date)) {
+          previewEl.innerHTML = existing && existing.reward
+            ? `🎮 この日記でもらった分：<b>${existing.reward.exp} EXP</b>（おととい以前の日記は書き直しても変わりません）`
+            : '🎮 経験値がもらえるのは今日と昨日の日記だけです';
+          return;
+        }
+        const r = diaryReward(state);
+        const st = fmtStats(r.stats);
+        previewEl.innerHTML = `🎮 この日記でもらえる：<b>${r.exp} EXP</b>${st ? `<div class="reward-stats">${st}</div>` : ''}
+          <div class="muted" style="margin-top:4px">項目を書くと、項目ごとに決まったステータスが上がります（1日${MAX_STAT_CATS}項目まで）。</div>`;
+      }
+
       function rerender(focusCi) {
+        renderPreview();
         renderChips(); renderBlocks();
         if (focusCi != null) {
           const inputs = blocksEl.querySelectorAll(`input[data-ci="${focusCi}"]`);
@@ -212,7 +237,7 @@
       });
       blocksEl.addEventListener('input', (e) => {
         const t = e.target;
-        if (t.dataset.ci != null && t.dataset.ii != null) { state.categories[t.dataset.ci].items[t.dataset.ii] = t.value; dirty = true; }
+        if (t.dataset.ci != null && t.dataset.ii != null) { state.categories[t.dataset.ci].items[t.dataset.ii] = t.value; dirty = true; renderPreview(); }
       });
       blocksEl.addEventListener('keydown', (e) => {
         const t = e.target; // Enter で次の行を追加
@@ -241,7 +266,7 @@
       document.getElementById('moods').addEventListener('click', (e) => {
         const b = e.target.closest('button'); if (!b) return;
         const v = +b.dataset.v;
-        state.mood = state.mood === v ? 0 : v; dirty = true;
+        state.mood = state.mood === v ? 0 : v; dirty = true; renderPreview();
         document.querySelectorAll('#moods button').forEach((x) => x.setAttribute('aria-pressed', +x.dataset.v === state.mood));
       });
       document.getElementById('vis').addEventListener('click', (e) => {
@@ -250,8 +275,8 @@
         document.querySelectorAll('#vis button').forEach((x) => x.setAttribute('aria-pressed', (x.dataset.v === '1') === state.shared));
         visNote();
       });
-      document.getElementById('title').addEventListener('input', (e) => { state.title = e.target.value; dirty = true; });
-      document.getElementById('text').addEventListener('input', (e) => { state.text = e.target.value; dirty = true; });
+      document.getElementById('title').addEventListener('input', (e) => { state.title = e.target.value; dirty = true; renderPreview(); });
+      document.getElementById('text').addEventListener('input', (e) => { state.text = e.target.value; dirty = true; renderPreview(); });
 
       const saveBtn = document.getElementById('save');
       saveBtn.onclick = async () => {
@@ -263,7 +288,8 @@
         }
         saveBtn.disabled = true; saveBtn.textContent = '保存中…';
         try {
-          await saveDiary(date, { title: state.title.trim(), text: state.text, mood: state.mood, categories: cats, shared: state.shared }, existing);
+          const reward = await saveDiary(date, { title: state.title.trim(), text: state.text, mood: state.mood, categories: cats, shared: state.shared }, existing);
+          try { if (reward) sessionStorage.setItem(REWARD_KEY, JSON.stringify({ ...reward, date })); } catch { /* noop */ }
           dirty = false;
           location.href = `diary.html?date=${date}&saved=1`;
         } catch (err) {
