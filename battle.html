@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Daylogger | バトル</title>
+  <title>DiaryQuest | バトル</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Klee+One:wght@600&family=Zen+Maru+Gothic:wght@400;700&display=swap" rel="stylesheet">
@@ -72,8 +72,9 @@
           </div>
           <div class="stat-grid">${STATS.map((s) => `
             <div class="stat-tile"><span>${s.icon} ${s.name}</span><b>${bs[s.key]}</b><small>日記で +${Math.max(0, (player.stats || {})[s.key] || 0)}</small></div>`).join('')}
+            <div class="stat-tile"><span>💧 最大MP</span><b>${bs.mp}</b><small>レベルと まりょく で上がる</small></div>
+            <div class="stat-tile"><span>🏆 戦績</span><b>${player.wins || 0}<small>勝</small> ${player.losses || 0}<small>敗</small></b><small>バトルの結果</small></div>
           </div>
-          <p class="muted" style="margin:10px 0 0">MP ${bs.mp}　・　戦績 ${player.wins || 0}勝 ${player.losses || 0}敗</p>
 
           <h3 class="sub-title">スキル</h3>
           <div class="skill-list">${SKILLS.filter((s) => s.lv <= cutoff).map((s) => `
